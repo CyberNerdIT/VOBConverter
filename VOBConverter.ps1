@@ -7,13 +7,16 @@
     - Optical drives are polled continuously in the background; every disc
       inserted into the Windows machine shows up as a card in the menu the
       moment it is ready, and disappears when ejected.
-    - Each DVD-Video disc card shows the volume label, drive letter, main
-      title size and part count, plus an editable output name box and
-      Preview / Convert / Test Output buttons.
-    - Preview plays a short snippet of the main title in VLC so you can
+    - Each DVD-Video disc card lists every title set on the disc with size
+      and part count; the largest is auto-selected as the main movie, and
+      when two title sets are close in size and the auto-select picked the
+      wrong one you can tick the right one instead - or manually add VOB
+      file(s) to the merge list via 'Add VOB file...'. The card also has an
+      editable output name box and Preview / Convert / Test Output buttons.
+    - Preview plays a short snippet of the selected files in VLC so you can
       confirm it is the right content.
-    - Convert stages the disc to the local machine first: the main title's
-      VOB parts are merged (binary concat) straight off the disc into ONE
+    - Convert stages the disc to the local machine first: the selected
+      VOB files are merged (binary concat) straight off the disc into ONE
       local file under the staging folder (default: Downloads\VOB) - copy
       and merge combined in a single pass. The merged VOB is kept, then
       transcoded to MP4 via VLC CLI (H.264 CRF 18, AAC 256k 48kHz) in a
@@ -52,6 +55,8 @@ $sync.ConvertingId  = ''
 $sync.LastSignature = $null
 $sync.Runspaces     = New-Object System.Collections.ArrayList
 $sync.NameOverrides = @{}     # discId -> output name the user typed (survives menu rebuilds)
+$sync.TitleSelections = @{}   # discId -> hashtable of VTS number -> $true/$false (checkbox state)
+$sync.ExtraFiles      = @{}   # discId -> ArrayList of manually added VOB paths
 # Background runspaces enqueue log lines here; the UI timer drains the queue
 $sync.LogQueue      = [System.Collections.Queue]::Synchronized((New-Object System.Collections.Queue))
 
@@ -294,7 +299,7 @@ function Write-VCLog {
     $sync.LogBox.ScrollToEnd()
 }
 
-function Get-MainTitleVobs {
+function Get-VCTitleSets {
     param([string]$VideoTsPath)
 
     # Group VTS_xx_1..9.VOB by title set number; skip VTS_xx_0.VOB (menus)
@@ -302,14 +307,48 @@ function Get-MainTitleVobs {
         Where-Object { $_.Name -match '^VTS_(\d\d)_([1-9])\.VOB$' } |
         Group-Object { $_.Name.Substring(4,2) }
 
-    if (-not $groups) { return $null }
+    if (-not $groups) { return @() }
 
-    # Main movie = title set with largest total size
-    $main = $groups | Sort-Object { ($_.Group | Measure-Object Length -Sum).Sum } -Descending |
-        Select-Object -First 1
+    $sets = foreach ($g in $groups) {
+        [pscustomobject]@{
+            Number = $g.Name
+            Vobs   = @($g.Group | Sort-Object Name)   # part order: VTS_xx_1, _2, ...
+            Size   = ($g.Group | Measure-Object Length -Sum).Sum
+        }
+    }
 
-    # Return VOBs in part order (VTS_xx_1, _2, ...)
-    return $main.Group | Sort-Object Name
+    # Largest first: [0] is the auto-selected "main movie" candidate
+    return @($sets | Sort-Object Size -Descending)
+}
+
+function Get-VCSelectedVobPaths {
+    # The files that will actually be merged: the title sets ticked on the disc
+    # card (defaults to the largest set), plus any manually added VOB files.
+    param([string]$VideoTsPath, [string]$DiscId)
+
+    $sets  = Get-VCTitleSets -VideoTsPath $VideoTsPath
+    $sel   = $sync.TitleSelections[$DiscId]
+    $paths = New-Object System.Collections.Generic.List[string]
+
+    if ($sets.Count -gt 0) {
+        if (-not $sel) {
+            foreach ($v in $sets[0].Vobs) { $paths.Add($v.FullName) }   # auto: largest title set
+        } else {
+            foreach ($s in ($sets | Sort-Object Number)) {
+                if ($sel[$s.Number]) { foreach ($v in $s.Vobs) { $paths.Add($v.FullName) } }
+            }
+        }
+    }
+
+    $extras = $sync.ExtraFiles[$DiscId]
+    if ($extras) {
+        foreach ($p in $extras) {
+            if (Test-Path $p) { $paths.Add($p) }
+            else { Write-VCLog "Added file no longer found, skipping: $p" }
+        }
+    }
+
+    return ,$paths
 }
 
 function Invoke-VCPreview {
@@ -390,8 +429,11 @@ function Start-VCConversion {
         catch { Write-VCLog "Cannot create folder '$dir': $($_.Exception.Message)"; return }
     }
 
-    $vobs = Get-MainTitleVobs -VideoTsPath $VideoTsPath
-    if (-not $vobs) { Write-VCLog "No title VOBs found on '$Label'."; return }
+    $vobPaths = Get-VCSelectedVobPaths -VideoTsPath $VideoTsPath -DiscId $DiscId
+    if ($vobPaths.Count -eq 0) {
+        Write-VCLog "Nothing selected on '$Label' - tick at least one title set or add a VOB file."
+        return
+    }
 
     $safeName = Get-VCSafeName -Name $OutputName -Fallback $Label
     $mergedVob = Join-Path $stagingDir "$safeName.vob"
@@ -404,7 +446,8 @@ function Start-VCConversion {
     $sync.ConvertingId  = $DiscId
     $sync.LastSignature = $null   # force disc menu rebuild so buttons reflect busy state
     $sync.BusyBar.Visibility = 'Visible'
-    Write-VCLog "Converting '$Label' as '$safeName' ($($vobs.Count) VOB part(s)) -> $outFile"
+    Write-VCLog "Converting '$Label' as '$safeName' ($($vobPaths.Count) VOB file(s)) -> $outFile"
+    Write-VCLog ("Merge list: " + (($vobPaths | ForEach-Object { [System.IO.Path]::GetFileName($_) }) -join ', '))
 
     $convertScript = {
         param([string[]]$VobPaths, [string]$Vlc, [string]$MergedVob, [string]$OutFile)
@@ -464,7 +507,7 @@ function Start-VCConversion {
     $ps = [powershell]::Create()
     $ps.Runspace = $runspace
     [void]$ps.AddScript($convertScript).
-        AddArgument([string[]]($vobs | ForEach-Object { $_.FullName })).
+        AddArgument([string[]]$vobPaths).
         AddArgument($vlc).
         AddArgument($mergedVob).
         AddArgument($outFile)
@@ -521,6 +564,7 @@ function New-VCDiscCard {
     $detail.Opacity = 0.75
     $detail.Foreground = $sync.Form.Resources['MainForegroundColor']
 
+    $sets = @()
     if (-not $ready) {
         $title.Text  = "$letter  -  no disc"
         $title.Opacity = 0.5
@@ -529,11 +573,10 @@ function New-VCDiscCard {
         $title.Text  = "$letter  -  '$label'"
         $detail.Text = "No VIDEO_TS folder - not a DVD-Video disc."
     } else {
-        $vobs = Get-MainTitleVobs -VideoTsPath $videoTs
-        if ($vobs) {
-            $sizeGb = [math]::Round((($vobs | Measure-Object Length -Sum).Sum) / 1GB, 2)
+        $sets = Get-VCTitleSets -VideoTsPath $videoTs
+        if ($sets.Count -gt 0) {
             $title.Text  = "$letter  -  '$label'"
-            $detail.Text = "DVD-Video - main title: $($vobs.Count) VOB part(s), $sizeGb GB"
+            $detail.Text = "DVD-Video - $($sets.Count) title set(s). Largest is auto-selected; untick/tick to correct it."
         } else {
             $title.Text  = "$letter  -  '$label'"
             $detail.Text = "DVD-Video, but no title VOBs found."
@@ -542,6 +585,97 @@ function New-VCDiscCard {
     }
     [void]$info.Children.Add($title)
     [void]$info.Children.Add($detail)
+
+    if ($isDvd) {
+        # Remembered selection (survives menu rebuilds); default = largest title set
+        if (-not $sync.TitleSelections.ContainsKey($discId)) {
+            $init = @{}
+            $init[$sets[0].Number] = $true
+            $sync.TitleSelections[$discId] = $init
+        }
+        $sel = $sync.TitleSelections[$discId]
+
+        $setPanel = New-Object System.Windows.Controls.StackPanel
+        $setPanel.Margin = New-Object System.Windows.Thickness 0,6,0,0
+        foreach ($s in ($sets | Sort-Object Number)) {
+            $auto = if ($s.Number -eq $sets[0].Number) { '   (auto-selected: largest)' } else { '' }
+            $cb = New-Object System.Windows.Controls.CheckBox
+            $cb.Content    = 'VTS_{0} - {1} part(s) - {2} GB{3}' -f $s.Number, $s.Vobs.Count, [math]::Round($s.Size/1GB, 2), $auto
+            $cb.Foreground = $sync.Form.Resources['MainForegroundColor']
+            $cb.FontSize   = 11
+            $cb.Margin     = New-Object System.Windows.Thickness 0,1,0,1
+            $cb.IsChecked  = [bool]$sel[$s.Number]
+            $cb.Tag        = @{ DiscId = $discId; Vts = $s.Number }
+            $cb.Add_Checked({   param($cbSender, $e) $sync.TitleSelections[$cbSender.Tag.DiscId][$cbSender.Tag.Vts] = $true })
+            $cb.Add_Unchecked({ param($cbSender, $e) $sync.TitleSelections[$cbSender.Tag.DiscId][$cbSender.Tag.Vts] = $false })
+            [void]$setPanel.Children.Add($cb)
+        }
+        [void]$info.Children.Add($setPanel)
+
+        # Manually add VOB files if the auto-selection got it wrong
+        if (-not $sync.ExtraFiles.ContainsKey($discId)) {
+            $sync.ExtraFiles[$discId] = New-Object System.Collections.ArrayList
+        }
+        $extraRow = New-Object System.Windows.Controls.StackPanel
+        $extraRow.Orientation = 'Horizontal'
+        $extraRow.Margin = New-Object System.Windows.Thickness 0,4,0,0
+
+        $extraLabel = New-Object System.Windows.Controls.TextBlock
+        $extraLabel.FontSize = 11
+        $extraLabel.Opacity  = 0.75
+        $extraLabel.VerticalAlignment = 'Center'
+        $extraLabel.Margin = New-Object System.Windows.Thickness 8,0,0,0
+        $extraLabel.Foreground = $sync.Form.Resources['MainForegroundColor']
+        if ($sync.ExtraFiles[$discId].Count -gt 0) {
+            $extraLabel.Text = "$($sync.ExtraFiles[$discId].Count) added file(s)"
+        }
+
+        $extraTag = @{ DiscId = $discId; VideoTs = $videoTs; Label = $extraLabel }
+
+        $addBtn = New-Object System.Windows.Controls.Button
+        $addBtn.Style   = $sync.Form.Resources['WinUtilButton']
+        $addBtn.Content = 'Add VOB file...'
+        $addBtn.ToolTip = 'Manually add VOB file(s) to the merge list, e.g. when the auto-selected title set is wrong'
+        $addBtn.Tag     = $extraTag
+        $addBtn.Add_Click({
+            param($btnSender, $e)
+            $dlg = New-Object Microsoft.Win32.OpenFileDialog
+            $dlg.Title  = 'Add VOB file(s) to the merge list'
+            $dlg.Filter = 'VOB files (*.vob)|*.vob|All files (*.*)|*.*'
+            $dlg.Multiselect = $true
+            if (Test-Path $btnSender.Tag.VideoTs) { $dlg.InitialDirectory = $btnSender.Tag.VideoTs }
+            if ($dlg.ShowDialog()) {
+                $list = $sync.ExtraFiles[$btnSender.Tag.DiscId]
+                foreach ($f in $dlg.FileNames) {
+                    if (-not $list.Contains($f)) {
+                        [void]$list.Add($f)
+                        Write-VCLog "Added to merge list: $f"
+                    }
+                }
+                $btnSender.Tag.Label.Text = "$($list.Count) added file(s)"
+            }
+        })
+
+        $clearBtn = New-Object System.Windows.Controls.Button
+        $clearBtn.Style   = $sync.Form.Resources['WinUtilButton']
+        $clearBtn.Content = 'Clear added'
+        $clearBtn.ToolTip = 'Remove all manually added files from the merge list'
+        $clearBtn.Tag     = $extraTag
+        $clearBtn.Add_Click({
+            param($btnSender, $e)
+            $list = $sync.ExtraFiles[$btnSender.Tag.DiscId]
+            if ($list.Count -gt 0) {
+                $list.Clear()
+                Write-VCLog 'Cleared manually added files from the merge list.'
+            }
+            $btnSender.Tag.Label.Text = ''
+        })
+
+        [void]$extraRow.Children.Add($addBtn)
+        [void]$extraRow.Children.Add($clearBtn)
+        [void]$extraRow.Children.Add($extraLabel)
+        [void]$info.Children.Add($extraRow)
+    }
     [void]$grid.Children.Add($info)
 
     if ($isDvd) {
@@ -590,14 +724,14 @@ function New-VCDiscCard {
         $previewBtn = New-Object System.Windows.Controls.Button
         $previewBtn.Style   = $sync.Form.Resources['WinUtilButton']
         $previewBtn.Content = 'Preview'
-        $previewBtn.ToolTip = 'Play a short snippet of the main title from the disc'
+        $previewBtn.ToolTip = 'Play a short snippet of the selected files from the disc'
         $previewBtn.Tag     = $discInfo
         $previewBtn.Add_Click({
             param($btnSender, $e)
             $info = $btnSender.Tag
-            $vobs = Get-MainTitleVobs -VideoTsPath $info.VideoTs
-            if ($vobs) { Invoke-VCPreview -VobPath $vobs[0].FullName -Label $info.Label }
-            else { Write-VCLog "No title VOBs found on '$($info.Label)'." }
+            $paths = Get-VCSelectedVobPaths -VideoTsPath $info.VideoTs -DiscId $info.DiscId
+            if ($paths.Count -gt 0) { Invoke-VCPreview -VobPath $paths[0] -Label $info.Label }
+            else { Write-VCLog "Nothing selected on '$($info.Label)' - tick a title set or add a VOB file." }
         })
 
         $testBtn = New-Object System.Windows.Controls.Button
