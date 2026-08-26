@@ -23,6 +23,11 @@
       background runspace, so the watcher and the UI stay responsive.
     - Test Output plays a snippet of the converted MP4 so you can verify
       the result without hunting for the file.
+    - A progress bar shows percent done and estimated time to completion:
+      byte-accurate (with MB/s) during the copy+merge phase, and during the
+      VLC transcode it polls VLC's local-only HTTP status interface
+      (127.0.0.1, random port + password) for the real position; if that
+      interface is unavailable it falls back to elapsed time + MB written.
     - Optional Auto-Convert toggle: when on, every new DVD-Video disc is
       converted automatically on insertion, no clicks needed.
 
@@ -57,6 +62,8 @@ $sync.Runspaces     = New-Object System.Collections.ArrayList
 $sync.NameOverrides = @{}     # discId -> output name the user typed (survives menu rebuilds)
 $sync.TitleSelections = @{}   # discId -> hashtable of VTS number -> $true/$false (checkbox state)
 $sync.ExtraFiles      = @{}   # discId -> ArrayList of manually added VOB paths
+$sync.ProgressValue   = 0.0   # 0..100, or -1 for indeterminate (set by the conversion runspace)
+$sync.ProgressMessage = ''    # e.g. "Copy+merge: 42% - 118 MB/s - ETA 0:38"
 # Background runspaces enqueue log lines here; the UI timer drains the queue
 $sync.LogQueue      = [System.Collections.Queue]::Synchronized((New-Object System.Collections.Queue))
 
@@ -253,10 +260,13 @@ $inputXML = @'
                 </ScrollViewer>
             </Border>
 
-            <!-- Progress -->
-            <Grid Grid.Row="3" Margin="10,0,10,6">
-                <ProgressBar Name="BusyBar" Height="6" IsIndeterminate="True" Visibility="Collapsed"
-                             Foreground="{StaticResource AccentColor}" Background="Transparent" BorderThickness="0"/>
+            <!-- Progress: percent + estimated time to completion -->
+            <Grid Grid.Row="3" Margin="10,0,10,6" Name="ProgressRow" Visibility="Collapsed">
+                <ProgressBar Name="BusyBar" Height="18" Minimum="0" Maximum="100"
+                             Foreground="{StaticResource AccentColor}" Background="#1A1A1A"
+                             BorderBrush="{StaticResource BorderColor}" BorderThickness="1"/>
+                <TextBlock Name="ProgressText" HorizontalAlignment="Center" VerticalAlignment="Center"
+                           FontFamily="Consolas, Monaco" FontSize="11"/>
             </Grid>
 
             <!-- Log -->
@@ -281,7 +291,7 @@ try {
 # Grab named controls into $sync (WinUtil pattern)
 foreach ($name in @('TitleBar','WatcherStateText','MinimizeButton','CloseButton',
                     'OutputDirBox','StagingDirBox','VlcPathBox','AutoConvertToggle',
-                    'SnippetStartBox','SnippetLengthBox','DiscPanel','BusyBar','LogBox')) {
+                    'SnippetStartBox','SnippetLengthBox','DiscPanel','ProgressRow','BusyBar','ProgressText','LogBox')) {
     $sync[$name] = $sync.Form.FindName($name)
 }
 
@@ -442,10 +452,15 @@ function Start-VCConversion {
         $outFile = Join-Path $outDir ("{0}_{1}.mp4" -f $safeName, (Get-Date -Format 'yyyyMMdd_HHmmss'))
     }
 
-    $sync.Converting    = $true
-    $sync.ConvertingId  = $DiscId
-    $sync.LastSignature = $null   # force disc menu rebuild so buttons reflect busy state
-    $sync.BusyBar.Visibility = 'Visible'
+    $sync.Converting      = $true
+    $sync.ConvertingId    = $DiscId
+    $sync.LastSignature   = $null   # force disc menu rebuild so buttons reflect busy state
+    $sync.ProgressValue   = 0.0
+    $sync.ProgressMessage = 'Starting...'
+    $sync.BusyBar.IsIndeterminate = $false
+    $sync.BusyBar.Value = 0
+    $sync.ProgressText.Text = 'Starting...'
+    $sync.ProgressRow.Visibility = 'Visible'
     Write-VCLog "Converting '$Label' as '$safeName' ($($vobPaths.Count) VOB file(s)) -> $outFile"
     Write-VCLog ("Merge list: " + (($vobPaths | ForEach-Object { [System.IO.Path]::GetFileName($_) }) -join ', '))
 
@@ -457,22 +472,69 @@ function Start-VCConversion {
             $sync.LogQueue.Enqueue($Message)
         }
 
+        function Set-Progress([double]$Percent, [string]$Message) {
+            # -1 percent = indeterminate; UI timer mirrors these onto the progress bar
+            $sync.ProgressValue   = $Percent
+            $sync.ProgressMessage = $Message
+        }
+
+        function Format-Eta([double]$Seconds) {
+            if ($Seconds -lt 0 -or $Seconds -gt 359999) { return '--:--' }
+            $ts = [TimeSpan]::FromSeconds($Seconds)
+            if ($ts.TotalHours -ge 1) { return $ts.ToString('h\:mm\:ss') }
+            return $ts.ToString('m\:ss')
+        }
+
         try {
-            # Copy + merge in one pass: read the title's VOB parts straight off
-            # the disc and binary-concat them into ONE local file in the staging
-            # folder. The merged file is kept as the local copy of the disc.
-            Send-Log "Copying + merging $($VobPaths.Count) VOB part(s) from disc -> $MergedVob ..."
+            # --- Phase 1: copy + merge in one pass, with byte-accurate progress ---
+            # Read the selected VOB files straight off the disc and binary-concat
+            # them into ONE local file in the staging folder. The merged file is
+            # kept as the local copy of the disc.
+            Send-Log "Copying + merging $($VobPaths.Count) VOB file(s) from disc -> $MergedVob ..."
+            $totalBytes = 0
+            foreach ($v in $VobPaths) { $totalBytes += (Get-Item $v).Length }
+            $doneBytes = 0
+            $buffer = New-Object byte[] (8MB)
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $lastUi = 0.0
+
             $out = [System.IO.File]::Create($MergedVob)
             try {
                 foreach ($v in $VobPaths) {
                     $in = [System.IO.File]::OpenRead($v)
-                    try { $in.CopyTo($out) } finally { $in.Dispose() }
+                    try {
+                        while (($n = $in.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                            $out.Write($buffer, 0, $n)
+                            $doneBytes += $n
+                            if ($sw.Elapsed.TotalSeconds - $lastUi -ge 0.5) {
+                                $lastUi = $sw.Elapsed.TotalSeconds
+                                $pct   = 100.0 * $doneBytes / [math]::Max(1, $totalBytes)
+                                $speed = $doneBytes / [math]::Max(0.1, $sw.Elapsed.TotalSeconds)   # bytes/s
+                                $eta   = ($totalBytes - $doneBytes) / [math]::Max(1, $speed)
+                                Set-Progress $pct ('Copy+merge: {0:N0}% - {1:N1} MB/s - ETA {2}' -f $pct, ($speed/1MB), (Format-Eta $eta))
+                            }
+                        }
+                    } finally { $in.Dispose() }
                 }
             } finally { $out.Dispose() }
             $mergedMb = [math]::Round((Get-Item $MergedVob).Length / 1MB, 1)
+            Set-Progress 100 'Copy+merge: done'
             Send-Log "Merged VOB staged locally: $MergedVob ($mergedMb MB). Disc is no longer needed."
 
+            # --- Phase 2: VLC transcode, progress polled from VLC's local HTTP status ---
             Send-Log "Transcoding with VLC (H.264 CRF 18, AAC 256k) - this can take a while..."
+            Set-Progress -1 'Converting: starting VLC...'
+
+            # Find a free localhost port for VLC's status interface
+            $httpPort = 0
+            try {
+                $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+                $listener.Start()
+                $httpPort = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+                $listener.Stop()
+            } catch { $httpPort = 0 }
+            $httpPass = [guid]::NewGuid().ToString('N')
+
             $sout = "#transcode{vcodec=h264,venc=x264{crf=18,preset=slow},acodec=mp4a,ab=256,channels=2,samplerate=48000}:std{access=file,mux=mp4,dst='$OutFile'}"
             $vlcArgs = @(
                 '--intf', 'dummy',
@@ -481,11 +543,56 @@ function Start-VCConversion {
                 "--sout=$sout",
                 'vlc://quit'
             )
-            Start-Process -FilePath $Vlc -ArgumentList $vlcArgs -Wait -WindowStyle Hidden
+            if ($httpPort -gt 0) {
+                # Local-only status interface so we can read the playback position
+                $vlcArgs = @('--extraintf', 'http', '--http-host', '127.0.0.1',
+                             '--http-port', "$httpPort", '--http-password', $httpPass) + $vlcArgs
+            }
+
+            $proc = Start-Process -FilePath $Vlc -ArgumentList $vlcArgs -PassThru -WindowStyle Hidden
+            $swT = [System.Diagnostics.Stopwatch]::StartNew()
+            $auth = 'Basic ' + [Convert]::ToBase64String([System.Text.Encoding]::ASCII.GetBytes(":$httpPass"))
+            $httpFails = 0
+            $httpDead  = ($httpPort -le 0)
+
+            while (-not $proc.HasExited) {
+                Start-Sleep -Milliseconds 1000
+                $elapsed = $swT.Elapsed.TotalSeconds
+                $gotPos = $false
+                if (-not $httpDead) {
+                    try {
+                        $wc = New-Object System.Net.WebClient
+                        $wc.Headers['Authorization'] = $auth
+                        $xml = [xml]$wc.DownloadString("http://127.0.0.1:$httpPort/requests/status.xml")
+                        $wc.Dispose()
+                        $pos = [double]$xml.root.position   # 0..1 through the source
+                        if ($pos -gt 0.005) {
+                            $pct = [math]::Min(99.9, $pos * 100.0)
+                            $eta = $elapsed * (1.0 - $pos) / $pos
+                            Set-Progress $pct ('Converting: {0:N1}% - ETA {1} (elapsed {2})' -f $pct, (Format-Eta $eta), (Format-Eta $elapsed))
+                            $gotPos = $true
+                            $httpFails = 0
+                        }
+                    } catch {
+                        $httpFails++
+                        if ($httpFails -ge 15) {
+                            $httpDead = $true
+                            Send-Log 'VLC status interface not reachable - showing elapsed time instead of ETA.'
+                        }
+                    }
+                }
+                if (-not $gotPos) {
+                    # Fallback: no position info; show elapsed time and output growth
+                    $outMb = 0
+                    if (Test-Path $OutFile) { $outMb = [math]::Round((Get-Item $OutFile).Length / 1MB, 0) }
+                    Set-Progress -1 ('Converting: elapsed {0} - {1} MB written' -f (Format-Eta $elapsed), $outMb)
+                }
+            }
 
             if (Test-Path $OutFile) {
                 $mb = [math]::Round((Get-Item $OutFile).Length / 1MB, 1)
-                Send-Log "Done: $OutFile ($mb MB). Use 'Test Output' on the disc card to verify it."
+                Set-Progress 100 'Done'
+                Send-Log ("Done in {0}: $OutFile ($mb MB). Use 'Test Output' on the disc card to verify it." -f (Format-Eta $swT.Elapsed.TotalSeconds))
             } else {
                 Send-Log "WARNING: output file not created - VLC transcode failed. The merged VOB is still at $MergedVob."
             }
@@ -830,18 +937,39 @@ $sync.CloseButton.Add_Click({ $sync.Form.Close() })
 # The DispatcherTimer never stops while the app runs: discs inserted into the
 # machine appear in the menu automatically, ejected ones disappear.
 if ($PollSeconds -lt 1) { $PollSeconds = 1 }
+$sync.PollSeconds = $PollSeconds
+$sync.TickCount   = 0
+# The timer ticks every second so the progress bar / ETA and log stay smooth;
+# the (slower) drive scan still runs every $PollSeconds ticks.
 $sync.Timer = New-Object System.Windows.Threading.DispatcherTimer
-$sync.Timer.Interval = [TimeSpan]::FromSeconds($PollSeconds)
+$sync.Timer.Interval = [TimeSpan]::FromSeconds(1)
 $sync.Timer.Add_Tick({
     # Relay log lines from background conversion runspaces
     while ($sync.LogQueue.Count -gt 0) {
         Write-VCLog ([string]$sync.LogQueue.Dequeue())
     }
-    # Busy bar mirrors the conversion state
-    $wanted = if ($sync.Converting) { 'Visible' } else { 'Collapsed' }
-    if ("$($sync.BusyBar.Visibility)" -ne $wanted) { $sync.BusyBar.Visibility = $wanted }
 
-    Update-VCDiscMenu
+    # Progress bar mirrors the conversion runspace's reported progress + ETA
+    if ($sync.Converting) {
+        if ("$($sync.ProgressRow.Visibility)" -ne 'Visible') { $sync.ProgressRow.Visibility = 'Visible' }
+        $v = [double]$sync.ProgressValue
+        if ($v -lt 0) {
+            if (-not $sync.BusyBar.IsIndeterminate) { $sync.BusyBar.IsIndeterminate = $true }
+        } else {
+            if ($sync.BusyBar.IsIndeterminate) { $sync.BusyBar.IsIndeterminate = $false }
+            $sync.BusyBar.Value = [math]::Min(100.0, $v)
+        }
+        $sync.ProgressText.Text = [string]$sync.ProgressMessage
+    } elseif ("$($sync.ProgressRow.Visibility)" -eq 'Visible') {
+        $sync.BusyBar.IsIndeterminate = $false
+        $sync.ProgressRow.Visibility = 'Collapsed'
+    }
+
+    $sync.TickCount++
+    if ($sync.TickCount -ge $sync.PollSeconds) {
+        $sync.TickCount = 0
+        Update-VCDiscMenu
+    }
 })
 
 $sync.Form.Add_Loaded({

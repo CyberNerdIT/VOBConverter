@@ -16,6 +16,7 @@ A [WinUtil](https://github.com/CyberNerdIT/winutil)-style PowerShell WPF menu fo
   - **Test Output** — plays a snippet of the converted MP4 so you can verify the result.
 - **Copy + merge in one pass** — on convert, the selected VOB files are read straight off the disc and binary-concatenated into **one local file** in the staging folder (default `%USERPROFILE%\Downloads\VOB\<name>.vob`). Copying and merging are a single pass; the merged VOB is kept as your local copy, and once it's staged the disc is no longer needed. The log shows the exact merge list before conversion starts.
 - **Background conversion** — the staged VOB is transcoded to MP4 via VLC CLI (H.264 CRF 18, AAC 256k 48kHz) in a background runspace, so the menu and the disc watcher stay responsive the whole time.
+- **Progress bar with ETA** — a determinate progress bar shows percent done and estimated time to completion for both phases: the copy+merge phase is byte-accurate (percent, MB/s, ETA), and the transcode phase reads VLC's real position via its local-only HTTP status interface (bound to `127.0.0.1` on a random port with a random password). If the status interface isn't reachable, it falls back to showing elapsed time and MB written.
 - **Auto-Convert toggle** — flip it on and every new DVD-Video disc is converted automatically on insertion, no clicks needed.
 - Editable settings in the menu: output folder, staging folder, VLC path, preview snippet start/length.
 
